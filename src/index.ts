@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+import * as ts from "typescript";
 import * as Configuration from "./configuration";
 import * as Formatters from "./formatters";
 import { FormatterConstructor } from "./language/formatter/formatter";
@@ -51,5 +52,6 @@ export interface ILinterOptions {
 }
 
 export interface ILinterPlugin {
-    lint(linter: Linter, fileName: string, source: string, configFile: Configuration.IConfigurationFile | undefined): boolean;
+    createProgram?(tsConfig: ts.ParsedCommandLine, projectPath: string, oldProgram: ts.Program): ts.Program | undefined;
+    lint?(linter: Linter, fileName: string, source: string, configFile: Configuration.IConfigurationFile | undefined): boolean;
 }

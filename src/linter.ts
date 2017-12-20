@@ -53,10 +53,7 @@ class Linter {
     private failures: RuleFailure[] = [];
     private fixes: RuleFailure[] = [];
 
-    /**
-     * Creates a TypeScript program object from a tsconfig.json file path and optional project directory.
-     */
-    public static createProgram(configFile: string, projectDirectory: string = path.dirname(configFile)): ts.Program {
+    public static getTsConfigContent(configFile: string, projectDirectory: string = path.dirname(configFile)): ts.ParsedCommandLine {
         const config = ts.readConfigFile(configFile, ts.sys.readFile);
         if (config.error !== undefined) {
             throw new FatalError(ts.formatDiagnostics([config.error], {
@@ -83,8 +80,26 @@ class Linter {
                 }));
             }
         }
-        const host = ts.createCompilerHost(parsed.options, true);
-        const program = ts.createProgram(parsed.fileNames, parsed.options, host);
+
+        return parsed;
+    }
+
+    /**
+     * Creates a TypeScript program object from a tsconfig.json file path and optional project directory.
+     */
+    public static createProgram(configFile: string | ts.ParsedCommandLine, projectDirectory?: string): ts.Program {
+        let parsedConfig: ts.ParsedCommandLine;
+        if (typeof configFile === "string") {
+            if (projectDirectory === undefined) {
+                projectDirectory = path.dirname(configFile);
+            }
+            parsedConfig = Linter.getTsConfigContent(configFile, projectDirectory);
+        } else {
+            parsedConfig = configFile;
+        }
+
+        const host = ts.createCompilerHost(parsedConfig.options, true);
+        const program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options, host);
 
         return program;
     }

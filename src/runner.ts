@@ -21,12 +21,12 @@ import * as fs from "fs";
 import * as glob from "glob";
 import { filter as createMinimatchFilter, Minimatch } from "minimatch";
 import * as path from "path";
+import * as resolve from "resolve";
 import * as ts from "typescript";
 
 import {
     DEFAULT_CONFIG,
     findConfiguration,
-    IConfigurationFile,
     JSON_CONFIG_FILENAME,
 } from "./configuration";
 import { FatalError } from "./error";
@@ -84,6 +84,11 @@ export interface Options {
      * Whether to output absolute paths
      */
     outputAbsolutePaths?: boolean;
+
+    /**
+     * Active plugin(s)
+     */
+    plugins?: string[];
 
     /**
      * tsconfig.json file.
@@ -158,7 +163,7 @@ async function runWorker(options: Options, logger: Logger): Promise<Status> {
 }
 
 async function runLinter(options: Options, logger: Logger): Promise<LintResult> {
-    const { files, program } = resolveFilesAndProgram(options, logger);
+    const { files, plugins, program } = resolveFilesProgramAndPlugins(options, logger);
     // if type checking, run the type checker
     if (program && options.typeCheck) {
         const diagnostics = ts.getPreEmitDiagnostics(program);
@@ -171,18 +176,33 @@ async function runLinter(options: Options, logger: Logger): Promise<LintResult> 
             }
         }
     }
-    return doLinting(options, files, program, logger);
+    return doLinting(options, files, plugins, program, logger);
 }
 
-function resolveFilesAndProgram(
-    { files, project, exclude, outputAbsolutePaths }: Options,
+function createDefaultPluginInstances(plugins: string[] | undefined, inputFilePath: string) {
+    const configuration = findConfiguration(null, inputFilePath);
+    let pluginNames = plugins ? plugins.splice(0) : [];
+    if (configuration.results && configuration.results.plugins) {
+        pluginNames = Array.from(new Set(pluginNames.concat(configuration.results.plugins)));
+    }
+
+    const pluginsInstances = createPluginInstances(pluginNames, configuration.path ? path.dirname(configuration.path) : process.cwd());
+    return pluginsInstances;
+
+}
+
+function resolveFilesProgramAndPlugins(
+    { files, project, plugins, exclude, outputAbsolutePaths }: Options,
     logger: Logger,
-): { files: string[]; program?: ts.Program } {
+): { files: string[]; plugins?: ILinterPlugin[]; program?: ts.Program } {
     // remove single quotes which break matching on Windows when glob is passed in single quotes
     exclude = exclude.map(trimSingleQuotes);
 
     if (project === undefined) {
-        return { files: resolveGlobs(files, exclude, outputAbsolutePaths, logger) };
+        return {
+            files: resolveGlobs(files, exclude, outputAbsolutePaths, logger),
+            plugins: createDefaultPluginInstances(plugins, process.cwd()),
+        };
     }
 
     const projectPath = findTsconfig(project);
@@ -190,8 +210,21 @@ function resolveFilesAndProgram(
         throw new FatalError(`Invalid option for project: ${project}`);
     }
 
+    const pluginsInstances = createDefaultPluginInstances(plugins, projectPath);
+
     exclude = exclude.map((pattern) => path.resolve(pattern));
-    const program = Linter.createProgram(projectPath);
+    const projectConfig = Linter.getTsConfigContent(projectPath);
+
+    let program = Linter.createProgram(projectConfig);
+    for (const pluginInstance of pluginsInstances) {
+        if (pluginInstance.createProgram) {
+            const newProgram = pluginInstance.createProgram(projectConfig, projectPath, program);
+            if (newProgram) {
+                program  = newProgram;
+            }
+        }
+    }
+
     let filesFound: string[];
     if (files.length === 0) {
         filesFound = filterFiles(Linter.getFileNames(program), exclude, false);
@@ -210,7 +243,7 @@ function resolveFilesAndProgram(
             }
         }
     }
-    return { files: filesFound, program };
+    return { files: filesFound, plugins: pluginsInstances, program };
 }
 
 function filterFiles(files: string[], patterns: string[], include: boolean): string[] {
@@ -236,31 +269,40 @@ function resolveGlobs(files: string[], ignore: string[], outputAbsolutePaths: bo
     return results.map((file) => outputAbsolutePaths ? path.resolve(cwd, file) : path.relative(cwd, file));
 }
 
-function createPluginInstances(configuration: IConfigurationFile | undefined): ILinterPlugin[] {
+function createPluginInstances(pluginNames: string[], basedir: string): ILinterPlugin[] {
     const plugins: ILinterPlugin[] = [];
-    if (configuration) {
-        for (const pluginName of configuration.plugins) {
-            const pluginModuleName = `tslint-plugin-${pluginName}`;
-            let pluginConstructor: (new() => ILinterPlugin) | undefined;
+    for (const pluginName of pluginNames) {
+        const pluginModuleName = `tslint-plugin-${pluginName}`;
+        let pluginConstructor: (new() => ILinterPlugin) | undefined;
+        try {
+            pluginConstructor = require(resolve.sync(pluginModuleName, {basedir})) as (new() => ILinterPlugin);
+        } catch (err1) {
             try {
-                pluginConstructor = require(pluginModuleName) as (new() => ILinterPlugin);
+                pluginConstructor = require(resolve.sync(pluginName, {basedir})) as (new() => ILinterPlugin);
+            } catch (err2) {
+                throw new FatalError(`'${pluginName}' plugin has failed to initialize because neither ` +
+                `'${pluginModuleName}' nor '${pluginName}' can be required. ` +
+                `Is the dependency installed ? (${err1}, ${err2})`);
+            }
+        }
+        if (pluginConstructor) {
+            let plugin;
+            try {
+                plugin = new pluginConstructor();
             } catch (err) {
-                throw new FatalError(`'${pluginName}' plugin has failed to initialize because '${pluginModuleName}' can't be required.` +
-                    `Is the dependency installed ? (${err})`);
+                throw new FatalError(`An error has occured while creating '${pluginName}' plugin instance. (${err})`);
             }
-            if (pluginConstructor) {
-                try {
-                    plugins.push(new pluginConstructor());
-                } catch (err) {
-                    throw new FatalError(`Àn error has occured while creating '${pluginName}' plugin instance. (${err})`);
-                }
+            if (!plugin.lint && !plugin.createProgram) {
+                throw new FatalError(`'${pluginName}' doesn't seem to be a TSLint plugin. (${plugin})`);
             }
+            plugins.push(plugin);
         }
     }
     return plugins;
 }
 
-async function doLinting(options: Options, files: string[], program: ts.Program | undefined, logger: Logger): Promise<LintResult> {
+async function doLinting(options: Options, files: string[], plugins: ILinterPlugin[] = [],
+                         program: ts.Program | undefined, logger: Logger): Promise<LintResult> {
     const linter = new Linter(
         {
             fix: !!options.fix,
@@ -272,14 +314,12 @@ async function doLinting(options: Options, files: string[], program: ts.Program 
 
     let lastFolder: string | undefined;
     let configFile = options.config !== undefined ? findConfiguration(options.config).results : undefined;
-    let plugins = createPluginInstances(configFile);
 
     for (const file of files) {
         if (options.config === undefined) {
             const folder = path.dirname(file);
             if (lastFolder !== folder) {
                 configFile = findConfiguration(null, folder).results;
-                plugins = createPluginInstances(configFile);
                 lastFolder = folder;
             }
         }
@@ -291,7 +331,7 @@ async function doLinting(options: Options, files: string[], program: ts.Program 
         if (contents !== undefined) {
             let lintBy: ILinterPlugin | undefined;
             for (const plugin of plugins) {
-                if (plugin.lint(linter, file, contents, configFile)) {
+                if (plugin.lint && plugin.lint(linter, file, contents, configFile)) {
                     lintBy = plugin;
                     break;
                 }

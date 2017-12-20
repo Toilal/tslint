@@ -33,6 +33,7 @@ interface Argv {
     init?: boolean;
     out?: string;
     outputAbsolutePaths: boolean;
+    plugin?: string[];
     project?: string;
     rulesDir?: string;
     formattersDir: string;
@@ -169,6 +170,15 @@ const options: Option[] = [
             this can be used to test custom rules.`,
     },
     {
+        name: "plugin",
+        type: "array",
+        describe: "active plugin(s)",
+        description: dedent`
+            The plugins to activate custom features like VueJS Single File Components.
+            tslint plugins can be found on npmjs.com by looking for package with name
+            matching 'tslint-plugin-*'.`,
+    },
+    {
         short: "p",
         name: "project",
         type: "string",
@@ -260,6 +270,7 @@ run(
         init: argv.init,
         out: argv.out,
         outputAbsolutePaths: argv.outputAbsolutePaths,
+        plugins: argv.plugin,
         project: argv.project,
         rulesDirectory: argv.rulesDir,
         test: argv.test,
